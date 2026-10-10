@@ -153,17 +153,24 @@ jobs:
           cat <<'EOF' > start.sh
           #!/bin/sh
           set -e
-          
+
+          # Ensure /dev/net/tun is available
+          mkdir -p /dev/net
+          if [ ! -c /dev/net/tun ]; then
+              mknod /dev/net/tun c 10 200 || true
+              chmod 666 /dev/net/tun || true
+          fi
+
           MEM="${MEM:=512m}"
           DISK="${DISK:=128M}"
           CPUS="${CPUS:=1}"
           bridge_index=0
-          
+
           get_mac_address() {
               ifname="$1"
               ip link show "$ifname" 2>/dev/null | awk '/link\/ether/ {print $2}'
           }
-          
+
           increment_mac() {
               mac=$1
               mac_no_colons=$(echo "$mac" | tr -d ':' | tr '[:lower:]' '[:upper:]')
@@ -172,14 +179,14 @@ jobs:
               mac_hex=$(printf "%012X" "$mac_dec")
               echo "$mac_hex" | sed 's/.\{2\}/&:/g;s/:$//'
           }
-          
+
           echo "" > /etc/qemu/bridge.conf
-          
+
           qemu="qemu-system-x86_64"
           if [[ `uname -m` == "aarch64" ]]; then
              qemu="qemu-system-aarch64 -pflash /usr/share/qemu/edk2-aarch64-code.fd -M virt"
           fi
-          
+
           if [ -e /dev/kvm ]; then
               qemu="$qemu -enable-kvm -cpu host"
           else
@@ -187,45 +194,86 @@ jobs:
                   qemu="$qemu -cpu cortex-a57"
               fi
           fi
-          
-          img=`ls /diskimage/*.img`
+
+          orig_img=`ls /diskimage/*.img 2>/dev/null | head -n 1`
+          if [ -d "/routeros" ]; then
+              img="/routeros/chr.img"
+              if [ ! -f "$img" ]; then
+                  echo "Initializing persistent disk from base image..."
+                  cp "$orig_img" "$img"
+              fi
+          else
+              img="$orig_img"
+          fi
+          truncate -s $DISK $img || true
+
           qemu="$qemu -nographic -m $MEM -smp cpus=$CPUS -drive file=$img,format=raw"
-          truncate -s $DISK $img
-          
+
           while read -r line; do
               iface=$(echo "$line" | sed "s/ *\([a-z0-9]*\):.*/\1/")
-              if [[ "$iface" =~ " " ]]; then
+              if [[ "$iface" =~ " " ]] || [[ "$iface" =~ ^br ]] || [[ "$iface" == "lo" ]] || [[ "$iface" == "" ]]; then
                   continue
               fi
-              if [[ "$iface" =~ ^br ]]; then
-                  continue
-              fi
-              if [[ "$iface" == "lo" ]]; then
-                  continue
-              fi
-              if [[ "$iface" == "" ]]; then
-                  continue
-              fi
-              echo "iface: $iface"
+              echo "Configuring interface: $iface"
               bridge="br$bridge_index"
               ip link add name "$bridge" type bridge
               ip link set dev "$bridge" up
+
+              iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)
+              iface_gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
+              if [ -z "$iface_gw" ]; then
+                  iface_gw=$(ip route show default 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
+              fi
+
               ip link set "$iface" master "$bridge"
               echo "allow $bridge" >> /etc/qemu/bridge.conf
-          
+
               veth_mac=$(get_mac_address "$iface")
               tap_mac=$(increment_mac "$veth_mac")
-          
+
+              if [ -n "$iface_ip" ]; then
+                  ip addr flush dev "$iface"
+                  ip addr add "$iface_ip" dev "$bridge"
+                  if [ -n "$iface_gw" ]; then
+                      ip route add default via "$iface_gw" dev "$bridge" || true
+                  fi
+
+                  ip_no_mask=$(echo "$iface_ip" | cut -d'/' -f1)
+                  subnet_prefix=$(echo "$ip_no_mask" | sed 's/\.[0-9]*$//')
+                  host_part=$(echo "$ip_no_mask" | awk -F. '{print $4}')
+
+                  if [ "$host_part" -eq 15 ]; then
+                      mikrotik_ip="${subnet_prefix}.16"
+                  else
+                      mikrotik_ip="${subnet_prefix}.15"
+                  fi
+
+                  dhcp_start="${subnet_prefix}.10"
+                  dhcp_end="${subnet_prefix}.20"
+
+                  echo "Starting dnsmasq on $bridge (MikroTik IP: $mikrotik_ip)..."
+                  dnsmasq --interface="$bridge" \
+                          --bind-interfaces \
+                          --dhcp-range="${dhcp_start},${dhcp_end},12h" \
+                          --dhcp-host="${tap_mac},${mikrotik_ip},infinite" \
+                          --dhcp-option=3,"${iface_gw}" \
+                          --dhcp-option=6,8.8.8.8,1.1.1.1 || true
+
+                  echo "Configuring iptables port forwarding to $mikrotik_ip..."
+                  iptables -t nat -A PREROUTING -d "$ip_no_mask" -p tcp -j DNAT --to-destination "$mikrotik_ip"
+                  iptables -t nat -A PREROUTING -d "$ip_no_mask" -p udp -j DNAT --to-destination "$mikrotik_ip"
+                  iptables -t nat -A POSTROUTING -j MASQUERADE
+              fi
+
               bridge_index=$((bridge_index + 1))
               qemu="$qemu -netdev bridge,id=$bridge,br=$bridge -device virtio-net,netdev=$bridge,mac=$tap_mac "
           done < /proc/net/dev
-          
+
           echo "qemu: $qemu"
           exec $qemu
           EOF
           chmod +x start.sh
 
-          
       - name: Create Dockerfile
         run: |
           cat > Dockerfile << 'EOF'
@@ -236,8 +284,9 @@ jobs:
                 amd64) apk add --no-cache qemu-system-x86_64 ;; \
                 arm64) apk add --no-cache qemu-system-aarch64 ;; \
               esac \
+              && apk add --no-cache dnsmasq iptables iproute2 \
               && rm -rf /var/cache/apk/*
-          RUN mkdir -p /diskimage
+          RUN mkdir -p /diskimage /routeros
           COPY ${TARGETARCH}/*.img /diskimage/
           COPY start.sh /start.sh
           ENTRYPOINT ["/start.sh"]
