@@ -160,6 +160,7 @@ jobs:
               mknod /dev/net/tun c 10 200 || true
               chmod 666 /dev/net/tun || true
           fi
+          sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
 
           MEM="${MEM:=512m}"
           DISK="${DISK:=128M}"
@@ -225,8 +226,18 @@ jobs:
               ip link set "$iface" master "$bridge"
               echo "allow $bridge" >> /etc/qemu/bridge.conf
 
-              veth_mac=$(get_mac_address "$iface")
-              tap_mac=$(increment_mac "$veth_mac")
+              mac_file="/routeros/mac_${bridge}"
+              if [ -d "/routeros" ] && [ -s "$mac_file" ]; then
+                  tap_mac=$(cat "$mac_file" | tr -d '\r\n ' | head -n 1)
+                  echo "Using persistent MAC for $bridge: $tap_mac"
+              else
+                  veth_mac=$(get_mac_address "$iface")
+                  tap_mac=$(increment_mac "$veth_mac")
+                  if [ -d "/routeros" ]; then
+                      echo "$tap_mac" > "$mac_file"
+                      echo "Saved persistent MAC for $bridge: $tap_mac"
+                  fi
+              fi
 
               if [ -n "$iface_ip" ]; then
                   ip addr flush dev "$iface"
