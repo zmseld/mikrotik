@@ -221,9 +221,6 @@ jobs:
 
               iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)
               iface_gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
-              if [ -z "$iface_gw" ]; then
-                  iface_gw=$(ip route show default 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
-              fi
 
               ip link set "$iface" master "$bridge"
               echo "allow $bridge" >> /etc/qemu/bridge.conf
@@ -235,7 +232,7 @@ jobs:
                   ip addr flush dev "$iface"
                   ip addr add "$iface_ip" dev "$bridge"
                   if [ -n "$iface_gw" ]; then
-                      ip route add default via "$iface_gw" dev "$bridge" || true
+                      ip route add default via "$iface_gw" dev "$bridge" 2>/dev/null || true
                   fi
 
                   ip_no_mask=$(echo "$iface_ip" | cut -d'/' -f1)
@@ -251,12 +248,21 @@ jobs:
                   dhcp_start="${subnet_prefix}.10"
                   dhcp_end="${subnet_prefix}.20"
 
+                  gw_option=""
+                  if [ -n "$iface_gw" ]; then
+                      gw_option="--dhcp-option=3,${iface_gw}"
+                  else
+                      gw_option="--dhcp-option=3"
+                  fi
+
                   echo "Starting dnsmasq on $bridge (MikroTik IP: $mikrotik_ip)..."
-                  dnsmasq --interface="$bridge" \
+                  dnsmasq --port=0 \
+                          --interface="$bridge" \
+                          --except-interface=lo \
                           --bind-interfaces \
                           --dhcp-range="${dhcp_start},${dhcp_end},12h" \
                           --dhcp-host="${tap_mac},${mikrotik_ip},infinite" \
-                          --dhcp-option=3,"${iface_gw}" \
+                          ${gw_option} \
                           --dhcp-option=6,8.8.8.8,1.1.1.1 || true
 
                   echo "Configuring iptables port forwarding to $mikrotik_ip..."
