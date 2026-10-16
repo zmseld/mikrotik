@@ -274,22 +274,17 @@ jobs:
                   udhcpd_leases="/tmp/udhcpd_${bridge}.leases"
                   touch "$udhcpd_leases"
 
-                  opt_router=""
+                  echo "start $ip_no_mask" > "$udhcpd_conf"
+                  echo "end $ip_no_mask" >> "$udhcpd_conf"
+                  echo "interface $bridge" >> "$udhcpd_conf"
+                  echo "max_leases 1" >> "$udhcpd_conf"
+                  echo "lease_file $udhcpd_leases" >> "$udhcpd_conf"
+                  echo "opt subnet $ip_mask" >> "$udhcpd_conf"
                   if [ -n "$iface_gw" ]; then
-                      opt_router="opt router $iface_gw"
+                      echo "opt router $iface_gw" >> "$udhcpd_conf"
                   fi
-
-                  cat <<EOF_DHCP > "$udhcpd_conf"
-start           $ip_no_mask
-end             $ip_no_mask
-interface       $bridge
-max_leases      1
-lease_file      $udhcpd_leases
-opt subnet      $ip_mask
-$opt_router
-opt dns         8.8.8.8 1.1.1.1
-static_lease    $tap_mac $ip_no_mask
-EOF_DHCP
+                  echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
+                  echo "static_lease $tap_mac $ip_no_mask" >> "$udhcpd_conf"
 
                   dummy_ip="10.$((200 + bridge_index)).0.1"
                   echo "Starting udhcpd on $bridge (MikroTik IP: $ip_no_mask, GW: ${iface_gw:-none})..."
