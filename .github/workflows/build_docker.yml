@@ -181,6 +181,25 @@ jobs:
               echo "$mac_hex" | sed 's/.\{2\}/&:/g;s/:$//'
           }
 
+          cidr2mask() {
+              local cdr=${1:-24}
+              local mask=""
+              local i
+              for i in 1 2 3 4; do
+                  if [ "$cdr" -ge 8 ]; then
+                      mask="${mask}255"
+                      cdr=$((cdr - 8))
+                  elif [ "$cdr" -gt 0 ]; then
+                      mask="${mask}$((256 - (1 << (8 - cdr))))"
+                      cdr=0
+                  else
+                      mask="${mask}0"
+                  fi
+                  [ "$i" -lt 4 ] && mask="${mask}."
+              done
+              echo "$mask"
+          }
+
           echo "" > /etc/qemu/bridge.conf
 
           qemu="qemu-system-x86_64"
@@ -240,46 +259,41 @@ jobs:
               fi
 
               if [ -n "$iface_ip" ]; then
-                  ip addr flush dev "$iface"
-                  ip addr add "$iface_ip" dev "$bridge"
-                  if [ -n "$iface_gw" ]; then
-                      ip route add default via "$iface_gw" dev "$bridge" 2>/dev/null || true
-                  fi
-
                   ip_no_mask=$(echo "$iface_ip" | cut -d'/' -f1)
-                  subnet_prefix=$(echo "$ip_no_mask" | sed 's/\.[0-9]*$//')
-                  host_part=$(echo "$ip_no_mask" | awk -F. '{print $4}')
+                  ip_cidr=$(echo "$iface_ip" | cut -s -d'/' -f2)
+                  [ -z "$ip_cidr" ] && ip_cidr=24
+                  ip_mask=$(cidr2mask "$ip_cidr")
 
-                  if [ "$host_part" -eq 15 ]; then
-                      mikrotik_ip="${subnet_prefix}.16"
-                  else
-                      mikrotik_ip="${subnet_prefix}.15"
-                  fi
+                  # Enable promiscuous mode so frames for tap_mac are accepted by interface
+                  ip link set dev "$iface" promisc on 2>/dev/null || true
 
-                  dhcp_start="${subnet_prefix}.10"
-                  dhcp_end="${subnet_prefix}.20"
+                  # Flush IP from interface so MikroTik exclusively owns this IP on the bridge
+                  ip addr flush dev "$iface"
 
-                  gw_option=""
+                  udhcpd_conf="/tmp/udhcpd_${bridge}.conf"
+                  udhcpd_leases="/tmp/udhcpd_${bridge}.leases"
+                  touch "$udhcpd_leases"
+
+                  opt_router=""
                   if [ -n "$iface_gw" ]; then
-                      gw_option="--dhcp-option=3,${iface_gw}"
-                  else
-                      gw_option="--dhcp-option=3"
+                      opt_router="opt router $iface_gw"
                   fi
 
-                  echo "Starting dnsmasq on $bridge (MikroTik IP: $mikrotik_ip)..."
-                  dnsmasq --port=0 \
-                          --interface="$bridge" \
-                          --except-interface=lo \
-                          --bind-interfaces \
-                          --dhcp-range="${dhcp_start},${dhcp_end},12h" \
-                          --dhcp-host="${tap_mac},${mikrotik_ip},infinite" \
-                          ${gw_option} \
-                          --dhcp-option=6,8.8.8.8,1.1.1.1 || true
+                  cat <<EOF_DHCP > "$udhcpd_conf"
+start           $ip_no_mask
+end             $ip_no_mask
+interface       $bridge
+max_leases      1
+lease_file      $udhcpd_leases
+opt subnet      $ip_mask
+$opt_router
+opt dns         8.8.8.8 1.1.1.1
+static_lease    $tap_mac $ip_no_mask
+EOF_DHCP
 
-                  echo "Configuring iptables port forwarding to $mikrotik_ip..."
-                  iptables -t nat -A PREROUTING -d "$ip_no_mask" -p tcp -j DNAT --to-destination "$mikrotik_ip"
-                  iptables -t nat -A PREROUTING -d "$ip_no_mask" -p udp -j DNAT --to-destination "$mikrotik_ip"
-                  iptables -t nat -A POSTROUTING -j MASQUERADE
+                  dummy_ip="10.$((200 + bridge_index)).0.1"
+                  echo "Starting udhcpd on $bridge (MikroTik IP: $ip_no_mask, GW: ${iface_gw:-none})..."
+                  udhcpd -I "$dummy_ip" -f "$udhcpd_conf" &
               fi
 
               bridge_index=$((bridge_index + 1))
@@ -301,7 +315,7 @@ jobs:
                 amd64) apk add --no-cache qemu-system-x86_64 ;; \
                 arm64) apk add --no-cache qemu-system-aarch64 ;; \
               esac \
-              && apk add --no-cache dnsmasq iptables iproute2 \
+              && apk add --no-cache busybox-extras dnsmasq iptables iproute2 \
               && rm -rf /var/cache/apk/*
           RUN mkdir -p /diskimage /routeros
           COPY ${TARGETARCH}/*.img /diskimage/
