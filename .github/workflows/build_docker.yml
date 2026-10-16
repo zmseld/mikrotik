@@ -229,12 +229,36 @@ jobs:
 
           qemu="$qemu -nographic -m $MEM -smp cpus=$CPUS -drive file=$img,format=raw"
 
+          all_ifaces=""
           while read -r line; do
-              iface=$(echo "$line" | sed "s/ *\([a-z0-9]*\):.*/\1/")
-              if [[ "$iface" =~ " " ]] || [[ "$iface" =~ ^br ]] || [[ "$iface" == "lo" ]] || [[ "$iface" == "" ]]; then
+              dev=$(echo "$line" | sed "s/ *\([a-z0-9]*\):.*/\1/")
+              if [[ "$dev" =~ " " ]] || [[ "$dev" =~ ^br ]] || [[ "$dev" == "lo" ]] || [[ "$dev" == "" ]]; then
                   continue
               fi
-              echo "Configuring interface: $iface"
+              all_ifaces="$all_ifaces $dev"
+          done < /proc/net/dev
+
+          wan_iface=""
+          other_ifaces=""
+          for dev in $all_ifaces; do
+              is_wan=0
+              if ip -d link show "$dev" 2>/dev/null | grep -q "macvlan"; then
+                  is_wan=1
+              elif ip route show default dev "$dev" 2>/dev/null | grep -q "default"; then
+                  is_wan=1
+              fi
+              if [ "$is_wan" -eq 1 ] && [ -z "$wan_iface" ]; then
+                  wan_iface="$dev"
+              else
+                  other_ifaces="$other_ifaces $dev"
+              fi
+          done
+
+          sorted_ifaces="$wan_iface $other_ifaces"
+
+          for iface in $sorted_ifaces; do
+              [ -z "$iface" ] && continue
+              echo "Configuring interface: $iface (br$bridge_index -> ether$((bridge_index + 1)))"
               bridge="br$bridge_index"
               ip link add name "$bridge" type bridge
               ip link set dev "$bridge" up
@@ -293,7 +317,7 @@ jobs:
 
               bridge_index=$((bridge_index + 1))
               qemu="$qemu -netdev bridge,id=$bridge,br=$bridge -device virtio-net,netdev=$bridge,mac=$tap_mac "
-          done < /proc/net/dev
+          done
 
           echo "qemu: $qemu"
           exec $qemu
