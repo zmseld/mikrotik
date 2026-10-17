@@ -167,6 +167,7 @@ jobs:
               chmod 666 /dev/net/tun || true
           fi
           sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+          sysctl -w net.ipv4.ip_nonlocal_bind=1 2>/dev/null || true
 
           MEM="${MEM:=512m}"
           DISK="${DISK:=128M}"
@@ -375,9 +376,9 @@ jobs:
                   echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
                   echo "static_lease $tap_mac $ip_no_mask" >> "$udhcpd_conf"
 
-                  dummy_ip="10.$((200 + bridge_index)).0.1"
-                  echo "Starting udhcpd on $bridge (MikroTik IP: $ip_no_mask, GW: ${iface_gw:-none})..."
-                  udhcpd -I "$dummy_ip" -f "$udhcpd_conf" &
+                  server_ip="${iface_gw:-${ip_prefix}.1}"
+                  echo "Starting udhcpd on $bridge (MikroTik IP: $ip_no_mask, GW: ${iface_gw:-none}, Server-ID: $server_ip)..."
+                  udhcpd -I "$server_ip" -f "$udhcpd_conf" &
               fi
 
               bridge_index=$((bridge_index + 1))
