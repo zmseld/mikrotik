@@ -329,10 +329,26 @@ jobs:
               echo "Configuring interface: $iface (target: ether$((bridge_index + 1)))"
 
               veth_mac=$(get_mac_address "$iface")
-              tap_mac="$veth_mac"
-              if [ -d "/routeros" ]; then
-                  echo "$tap_mac" > "/routeros/mac_ether$((bridge_index + 1))"
-                  echo "$tap_mac" > "/routeros/mac_br${bridge_index}" 2>/dev/null || true
+              mac_file="/routeros/mac_ether$((bridge_index + 1))"
+              if [ -d "/routeros" ] && [ -s "$mac_file" ]; then
+                  saved_mac=$(cat "$mac_file" | tr -d '\r\n ' | head -n 1)
+                  echo "Found persistent MAC for ether$((bridge_index + 1)): $saved_mac"
+                  ip link set dev "$iface" down 2>/dev/null || true
+                  if ip link set dev "$iface" address "$saved_mac" 2>/dev/null; then
+                      echo "Successfully restored MAC $saved_mac to $iface"
+                      tap_mac="$saved_mac"
+                  else
+                      echo "Could not change MAC of $iface, using current: $veth_mac"
+                      tap_mac="$veth_mac"
+                      echo "$tap_mac" > "$mac_file"
+                  fi
+                  ip link set dev "$iface" up 2>/dev/null || true
+              else
+                  tap_mac="$veth_mac"
+                  if [ -d "/routeros" ]; then
+                      echo "$tap_mac" > "$mac_file"
+                      echo "Saved persistent MAC for ether$((bridge_index + 1)): $tap_mac"
+                  fi
               fi
 
               iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)
