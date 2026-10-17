@@ -319,79 +319,140 @@ jobs:
           iptables -F FORWARD 2>/dev/null || true
           iptables -P FORWARD ACCEPT 2>/dev/null || true
 
+          if [ ! -c /dev/net/tun ]; then
+              mkdir -p /dev/net
+              mknod /dev/net/tun c 10 200 2>/dev/null || true
+          fi
+
           for iface in $sorted_ifaces; do
               [ -z "$iface" ] && continue
-              echo "Configuring interface: $iface (br$bridge_index -> ether$((bridge_index + 1)))"
-              bridge="br$bridge_index"
-              ip link add name "$bridge" type bridge
+              echo "Configuring interface: $iface (target: ether$((bridge_index + 1)))"
 
-              internal_net="10.199.$((bridge_index + 1))"
-              bridge_ip="${internal_net}.1"
-              mikrotik_ip="${internal_net}.2"
-
-              ip addr add "${bridge_ip}/30" dev "$bridge"
-              ip link set dev "$bridge" up
-              echo "allow $bridge" >> /etc/qemu/bridge.conf
+              veth_mac=$(get_mac_address "$iface")
+              tap_mac="$veth_mac"
+              if [ -d "/routeros" ]; then
+                  echo "$tap_mac" > "/routeros/mac_ether$((bridge_index + 1))"
+                  echo "$tap_mac" > "/routeros/mac_br${bridge_index}" 2>/dev/null || true
+              fi
 
               iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)
               iface_gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
 
-              if [ -z "$iface_gw" ] && [ "$bridge" = "br0" ]; then
+              if [ -z "$iface_gw" ] && [ "$bridge_index" -eq 0 ]; then
                   if [ -n "$GATEWAY" ]; then
                       iface_gw="$GATEWAY"
                   elif [ -n "$iface_ip" ]; then
                       ip_prefix=$(echo "$iface_ip" | cut -d'/' -f1 | sed 's/\.[0-9]*$//')
                       iface_gw="${ip_prefix}.1"
                   fi
-                  if [ -n "$iface_gw" ]; then
-                      ip route replace default via "$iface_gw" dev "$iface" 2>/dev/null || true
-                  fi
               fi
 
-              mac_file="/routeros/mac_${bridge}"
-              if [ -d "/routeros" ] && [ -s "$mac_file" ]; then
-                  tap_mac=$(cat "$mac_file" | tr -d '\r\n ' | head -n 1)
-                  echo "Using persistent MAC for $bridge: $tap_mac"
-              else
-                  veth_mac=$(get_mac_address "$iface")
-                  tap_mac=$(increment_mac "$veth_mac")
-                  if [ -d "/routeros" ]; then
-                      echo "$tap_mac" > "$mac_file"
-                      echo "Saved persistent MAC for $bridge: $tap_mac"
-                  fi
-              fi
-
+              ip_no_mask=""
+              ip_mask=""
               if [ -n "$iface_ip" ]; then
                   ip_no_mask=$(echo "$iface_ip" | cut -d'/' -f1)
+                  ip_cidr=$(echo "$iface_ip" | cut -s -d'/' -f2)
+                  [ -z "$ip_cidr" ] && ip_cidr=24
+                  ip_mask=$(cidr2mask "$ip_cidr")
+              fi
 
-                  udhcpd_conf="/tmp/udhcpd_${bridge}.conf"
-                  udhcpd_leases="/tmp/udhcpd_${bridge}.leases"
-                  touch "$udhcpd_leases"
+              tap="tap$bridge_index"
+              can_use_tc=false
 
-                  echo "start $mikrotik_ip" > "$udhcpd_conf"
-                  echo "end $mikrotik_ip" >> "$udhcpd_conf"
-                  echo "interface $bridge" >> "$udhcpd_conf"
-                  echo "max_leases 1" >> "$udhcpd_conf"
-                  echo "lease_file $udhcpd_leases" >> "$udhcpd_conf"
-                  echo "opt subnet 255.255.255.252" >> "$udhcpd_conf"
-                  if [ "$bridge" = "br0" ]; then
-                      echo "opt router $bridge_ip" >> "$udhcpd_conf"
-                      echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
+              if ip tuntap add dev "$tap" mode tap 2>/dev/null; then
+                  ip link set dev "$tap" address "$tap_mac" up 2>/dev/null || true
+                  ip link set dev "$iface" promisc on 2>/dev/null || true
+                  tc qdisc del dev "$iface" ingress 2>/dev/null || true
+                  tc qdisc del dev "$tap" ingress 2>/dev/null || true
+
+                  if tc qdisc add dev "$iface" ingress 2>/dev/null && \
+                     (tc filter add dev "$iface" ingress protocol all matchall action mirred egress redirect dev "$tap" 2>/dev/null || \
+                      tc filter add dev "$iface" ingress protocol all u32 match u32 0 0 action mirred egress redirect dev "$tap" 2>/dev/null) && \
+                     tc qdisc add dev "$tap" ingress 2>/dev/null && \
+                     (tc filter add dev "$tap" ingress protocol all matchall action mirred egress redirect dev "$iface" 2>/dev/null || \
+                      tc filter add dev "$tap" ingress protocol all u32 match u32 0 0 action mirred egress redirect dev "$iface" 2>/dev/null); then
+                      can_use_tc=true
+                      echo "Direct L2 mode (TC mirred) enabled for $iface <-> $tap (MAC: $tap_mac)"
                   fi
-                  echo "static_lease $tap_mac $mikrotik_ip" >> "$udhcpd_conf"
+              fi
 
-                  echo "Starting udhcpd on $bridge (MikroTik IP: $mikrotik_ip, GW: $bridge_ip)..."
-                  udhcpd -I "$bridge_ip" -f "$udhcpd_conf" &
+              if [ "$can_use_tc" = "true" ]; then
+                  if [ -n "$ip_no_mask" ]; then
+                      ip addr flush dev "$iface"
 
-                  echo "Configuring forwarding: $ip_no_mask ($iface) <-> $mikrotik_ip ($bridge)..."
-                  iptables -t nat -A PREROUTING -d "$ip_no_mask" -j DNAT --to-destination "$mikrotik_ip"
-                  iptables -t nat -A OUTPUT -d "$ip_no_mask" -j DNAT --to-destination "$mikrotik_ip"
-                  iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
-                  iptables -t nat -A POSTROUTING -o "$bridge" -j MASQUERADE
+                      udhcpd_conf="/tmp/udhcpd_${tap}.conf"
+                      udhcpd_leases="/tmp/udhcpd_${tap}.leases"
+                      touch "$udhcpd_leases"
+
+                      echo "start $ip_no_mask" > "$udhcpd_conf"
+                      echo "end $ip_no_mask" >> "$udhcpd_conf"
+                      echo "interface $tap" >> "$udhcpd_conf"
+                      echo "max_leases 1" >> "$udhcpd_conf"
+                      echo "lease_file $udhcpd_leases" >> "$udhcpd_conf"
+                      echo "opt subnet $ip_mask" >> "$udhcpd_conf"
+                      if [ "$bridge_index" -eq 0 ] && [ -n "$iface_gw" ]; then
+                          echo "opt router $iface_gw" >> "$udhcpd_conf"
+                          echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
+                      fi
+                      echo "static_lease $tap_mac $ip_no_mask" >> "$udhcpd_conf"
+
+                      server_ip="${iface_gw:-${ip_prefix}.1}"
+                      echo "Starting udhcpd on $tap (MikroTik IP: $ip_no_mask, GW: ${iface_gw:-none}, Server-ID: $server_ip)..."
+                      udhcpd -I "$server_ip" -f "$udhcpd_conf" &
+                  fi
+
+                  qemu="$qemu -netdev tap,id=$tap,ifname=$tap,script=no,downscript=no -device virtio-net,netdev=$tap,mac=$tap_mac "
+              else
+                  echo "TC mirred failed or unavailable, falling back to internal bridge + DNAT for $iface"
+                  ip link delete "$tap" 2>/dev/null || true
+
+                  bridge="br$bridge_index"
+                  ip link add name "$bridge" type bridge
+                  internal_net="10.199.$((bridge_index + 1))"
+                  bridge_ip="${internal_net}.1"
+                  mikrotik_ip="${internal_net}.2"
+
+                  ip addr add "${bridge_ip}/30" dev "$bridge"
+                  ip link set dev "$bridge" up
+                  echo "allow $bridge" >> /etc/qemu/bridge.conf
+
+                  if [ -z "$iface_gw" ] && [ "$bridge" = "br0" ]; then
+                      if [ -n "$iface_gw" ]; then
+                          ip route replace default via "$iface_gw" dev "$iface" 2>/dev/null || true
+                      fi
+                  fi
+
+                  if [ -n "$iface_ip" ]; then
+                      udhcpd_conf="/tmp/udhcpd_${bridge}.conf"
+                      udhcpd_leases="/tmp/udhcpd_${bridge}.leases"
+                      touch "$udhcpd_leases"
+
+                      echo "start $mikrotik_ip" > "$udhcpd_conf"
+                      echo "end $mikrotik_ip" >> "$udhcpd_conf"
+                      echo "interface $bridge" >> "$udhcpd_conf"
+                      echo "max_leases 1" >> "$udhcpd_conf"
+                      echo "lease_file $udhcpd_leases" >> "$udhcpd_conf"
+                      echo "opt subnet 255.255.255.252" >> "$udhcpd_conf"
+                      if [ "$bridge" = "br0" ]; then
+                          echo "opt router $bridge_ip" >> "$udhcpd_conf"
+                          echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
+                      fi
+                      echo "static_lease $tap_mac $mikrotik_ip" >> "$udhcpd_conf"
+
+                      echo "Starting udhcpd on $bridge (MikroTik IP: $mikrotik_ip, GW: $bridge_ip)..."
+                      udhcpd -I "$bridge_ip" -f "$udhcpd_conf" &
+
+                      echo "Configuring forwarding: $ip_no_mask ($iface) <-> $mikrotik_ip ($bridge)..."
+                      iptables -t nat -A PREROUTING -d "$ip_no_mask" -j DNAT --to-destination "$mikrotik_ip"
+                      iptables -t nat -A OUTPUT -d "$ip_no_mask" -j DNAT --to-destination "$mikrotik_ip"
+                      iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
+                      iptables -t nat -A POSTROUTING -o "$bridge" -j MASQUERADE
+                  fi
+
+                  qemu="$qemu -netdev bridge,id=$bridge,br=$bridge -device virtio-net,netdev=$bridge,mac=$tap_mac "
               fi
 
               bridge_index=$((bridge_index + 1))
-              qemu="$qemu -netdev bridge,id=$bridge,br=$bridge -device virtio-net,netdev=$bridge,mac=$tap_mac "
           done
 
           echo "qemu: $qemu"
@@ -409,7 +470,7 @@ jobs:
                 amd64) apk add --no-cache qemu-system-x86_64 ;; \
                 arm64) apk add --no-cache qemu-system-aarch64 ;; \
               esac \
-              && apk add --no-cache busybox-extras dnsmasq iptables iproute2 \
+              && apk add --no-cache busybox-extras dnsmasq iptables iproute2 iproute2-tc socat \
               && rm -rf /var/cache/apk/*
           RUN mkdir -p /diskimage /routeros
           COPY ${TARGETARCH}/*.img /diskimage/
