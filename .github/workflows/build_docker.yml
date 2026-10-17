@@ -312,17 +312,30 @@ jobs:
 
           sorted_ifaces="$wan_iface $lan_iface $remaining_ifaces"
 
+          sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+          sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+          sysctl -w net.ipv4.conf.default.rp_filter=0 2>/dev/null || true
+          iptables -t nat -F 2>/dev/null || true
+          iptables -F FORWARD 2>/dev/null || true
+          iptables -P FORWARD ACCEPT 2>/dev/null || true
+
           for iface in $sorted_ifaces; do
               [ -z "$iface" ] && continue
               echo "Configuring interface: $iface (br$bridge_index -> ether$((bridge_index + 1)))"
               bridge="br$bridge_index"
               ip link add name "$bridge" type bridge
+
+              internal_net="10.199.$((bridge_index + 1))"
+              bridge_ip="${internal_net}.1"
+              mikrotik_ip="${internal_net}.2"
+
+              ip addr add "${bridge_ip}/30" dev "$bridge"
               ip link set dev "$bridge" up
+              echo "allow $bridge" >> /etc/qemu/bridge.conf
 
               iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)
               iface_gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
 
-              # If gateway not found (e.g. macvlan), fallback to GATEWAY or .1 of subnet for br0
               if [ -z "$iface_gw" ] && [ "$bridge" = "br0" ]; then
                   if [ -n "$GATEWAY" ]; then
                       iface_gw="$GATEWAY"
@@ -330,10 +343,10 @@ jobs:
                       ip_prefix=$(echo "$iface_ip" | cut -d'/' -f1 | sed 's/\.[0-9]*$//')
                       iface_gw="${ip_prefix}.1"
                   fi
+                  if [ -n "$iface_gw" ]; then
+                      ip route replace default via "$iface_gw" dev "$iface" 2>/dev/null || true
+                  fi
               fi
-
-              ip link set "$iface" master "$bridge"
-              echo "allow $bridge" >> /etc/qemu/bridge.conf
 
               mac_file="/routeros/mac_${bridge}"
               if [ -d "/routeros" ] && [ -s "$mac_file" ]; then
@@ -350,35 +363,31 @@ jobs:
 
               if [ -n "$iface_ip" ]; then
                   ip_no_mask=$(echo "$iface_ip" | cut -d'/' -f1)
-                  ip_cidr=$(echo "$iface_ip" | cut -s -d'/' -f2)
-                  [ -z "$ip_cidr" ] && ip_cidr=24
-                  ip_mask=$(cidr2mask "$ip_cidr")
-
-                  # Enable promiscuous mode so frames for tap_mac are accepted by interface
-                  ip link set dev "$iface" promisc on 2>/dev/null || true
-
-                  # Flush IP from interface so MikroTik exclusively owns this IP on the bridge
-                  ip addr flush dev "$iface"
 
                   udhcpd_conf="/tmp/udhcpd_${bridge}.conf"
                   udhcpd_leases="/tmp/udhcpd_${bridge}.leases"
                   touch "$udhcpd_leases"
 
-                  echo "start $ip_no_mask" > "$udhcpd_conf"
-                  echo "end $ip_no_mask" >> "$udhcpd_conf"
+                  echo "start $mikrotik_ip" > "$udhcpd_conf"
+                  echo "end $mikrotik_ip" >> "$udhcpd_conf"
                   echo "interface $bridge" >> "$udhcpd_conf"
                   echo "max_leases 1" >> "$udhcpd_conf"
                   echo "lease_file $udhcpd_leases" >> "$udhcpd_conf"
-                  echo "opt subnet $ip_mask" >> "$udhcpd_conf"
-                  if [ -n "$iface_gw" ]; then
-                      echo "opt router $iface_gw" >> "$udhcpd_conf"
+                  echo "opt subnet 255.255.255.252" >> "$udhcpd_conf"
+                  if [ "$bridge" = "br0" ]; then
+                      echo "opt router $bridge_ip" >> "$udhcpd_conf"
+                      echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
                   fi
-                  echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
-                  echo "static_lease $tap_mac $ip_no_mask" >> "$udhcpd_conf"
+                  echo "static_lease $tap_mac $mikrotik_ip" >> "$udhcpd_conf"
 
-                  server_ip="${iface_gw:-${ip_prefix}.1}"
-                  echo "Starting udhcpd on $bridge (MikroTik IP: $ip_no_mask, GW: ${iface_gw:-none}, Server-ID: $server_ip)..."
-                  udhcpd -I "$server_ip" -f "$udhcpd_conf" &
+                  echo "Starting udhcpd on $bridge (MikroTik IP: $mikrotik_ip, GW: $bridge_ip)..."
+                  udhcpd -I "$bridge_ip" -f "$udhcpd_conf" &
+
+                  echo "Configuring forwarding: $ip_no_mask ($iface) <-> $mikrotik_ip ($bridge)..."
+                  iptables -t nat -A PREROUTING -d "$ip_no_mask" -j DNAT --to-destination "$mikrotik_ip"
+                  iptables -t nat -A OUTPUT -d "$ip_no_mask" -j DNAT --to-destination "$mikrotik_ip"
+                  iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
+                  iptables -t nat -A POSTROUTING -o "$bridge" -j MASQUERADE
               fi
 
               bridge_index=$((bridge_index + 1))
