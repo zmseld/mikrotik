@@ -3,7 +3,13 @@ name: Build CHR Docker
 on:
   schedule:
     - cron: "00 10 * * *"   # At UTC 09:00 (Beijing 17:00) on every day
-    
+
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build_docker.yml'
+
   workflow_dispatch:
     inputs:
       version:
@@ -14,7 +20,7 @@ on:
       force:
         description: "Force rebuild even if version already exists"
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -71,7 +77,7 @@ jobs:
         id: filter_matrix
         env:
           IMAGE: "ghcr.io/${{ github.repository_owner }}/chr"
-          FORCE: ${{ github.event.inputs.force == 'true' }}
+          FORCE: ${{ github.event.inputs.force == 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force != 'false') || github.event_name == 'push' }}
         run: |
           MATRIX='${{ steps.get_versions.outputs.MATRIX }}'
           if [ "$FORCE" = "true" ]; then
@@ -230,31 +236,80 @@ jobs:
           qemu="$qemu -nographic -m $MEM -smp cpus=$CPUS -drive file=$img,format=raw"
 
           all_ifaces=""
-          while read -r line; do
-              dev=$(echo "$line" | sed "s/ *\([a-z0-9]*\):.*/\1/")
-              if [[ "$dev" =~ " " ]] || [[ "$dev" =~ ^br ]] || [[ "$dev" == "lo" ]] || [[ "$dev" == "" ]]; then
-                  continue
-              fi
-              all_ifaces="$all_ifaces $dev"
-          done < /proc/net/dev
+          for dev_path in /sys/class/net/*; do
+              dev=$(basename "$dev_path")
+              case "$dev" in
+                  lo|br*|tun*|tap*|docker*|veth*) continue ;;
+                  *) all_ifaces="$all_ifaces $dev" ;;
+              esac
+          done
 
+          # 1. Determine primary WAN interface (br0 -> ether1)
+          # Priority: WAN_IFACE -> WAN_SUBNET -> macvlan/ipvlan -> 192.168.* -> default gateway -> first interface
           wan_iface=""
-          other_ifaces=""
           for dev in $all_ifaces; do
-              is_wan=0
-              if ip -d link show "$dev" 2>/dev/null | grep -q "macvlan"; then
-                  is_wan=1
-              elif ip route show default dev "$dev" 2>/dev/null | grep -q "default"; then
-                  is_wan=1
-              fi
-              if [ "$is_wan" -eq 1 ] && [ -z "$wan_iface" ]; then
+              dev_ip=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1)
+              if [ -n "$WAN_IFACE" ] && [ "$dev" = "$WAN_IFACE" ]; then
                   wan_iface="$dev"
-              else
-                  other_ifaces="$other_ifaces $dev"
+                  break
+              fi
+              if [ -n "$WAN_SUBNET" ] && echo "$dev_ip" | grep -q "$WAN_SUBNET"; then
+                  wan_iface="$dev"
+                  break
+              fi
+              if ip -d link show "$dev" 2>/dev/null | grep -qE "macvlan|ipvlan"; then
+                  wan_iface="$dev"
+                  break
+              fi
+              if echo "$dev_ip" | grep -q "^192\.168\."; then
+                  wan_iface="$dev"
+                  break
               fi
           done
 
-          sorted_ifaces="$wan_iface $other_ifaces"
+          if [ -z "$wan_iface" ]; then
+              for dev in $all_ifaces; do
+                  if ip route show default dev "$dev" 2>/dev/null | grep -q "default"; then
+                      wan_iface="$dev"
+                      break
+                  fi
+              done
+          fi
+
+          if [ -z "$wan_iface" ]; then
+              wan_iface=$(echo $all_ifaces | awk '{print $1}')
+          fi
+
+          # 2. Determine secondary LAN interface (br1 -> ether2)
+          # Priority: LAN_IFACE -> LAN_SUBNET -> 172.* private subnet
+          lan_iface=""
+          remaining_ifaces=""
+          for dev in $all_ifaces; do
+              [ "$dev" = "$wan_iface" ] && continue
+              dev_ip=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1)
+              if [ -z "$lan_iface" ]; then
+                  if [ -n "$LAN_IFACE" ] && [ "$dev" = "$LAN_IFACE" ]; then
+                      lan_iface="$dev"
+                      continue
+                  fi
+                  if [ -n "$LAN_SUBNET" ] && echo "$dev_ip" | grep -q "$LAN_SUBNET"; then
+                      lan_iface="$dev"
+                      continue
+                  fi
+                  if echo "$dev_ip" | grep -q "^172\."; then
+                      lan_iface="$dev"
+                      continue
+                  fi
+              fi
+              remaining_ifaces="$remaining_ifaces $dev"
+          done
+
+          if [ -z "$lan_iface" ] && [ -n "$remaining_ifaces" ]; then
+              lan_iface=$(echo $remaining_ifaces | awk '{print $1}')
+              remaining_ifaces=$(echo $remaining_ifaces | sed "s/\b$lan_iface\b//")
+          fi
+
+          sorted_ifaces="$wan_iface $lan_iface $remaining_ifaces"
 
           for iface in $sorted_ifaces; do
               [ -z "$iface" ] && continue
@@ -265,6 +320,16 @@ jobs:
 
               iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)
               iface_gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
+
+              # If gateway not found (e.g. macvlan), fallback to GATEWAY or .1 of subnet for br0
+              if [ -z "$iface_gw" ] && [ "$bridge" = "br0" ]; then
+                  if [ -n "$GATEWAY" ]; then
+                      iface_gw="$GATEWAY"
+                  elif [ -n "$iface_ip" ]; then
+                      ip_prefix=$(echo "$iface_ip" | cut -d'/' -f1 | sed 's/\.[0-9]*$//')
+                      iface_gw="${ip_prefix}.1"
+                  fi
+              fi
 
               ip link set "$iface" master "$bridge"
               echo "allow $bridge" >> /etc/qemu/bridge.conf
