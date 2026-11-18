@@ -236,240 +236,326 @@ jobs:
 
           qemu="$qemu -nographic -m $MEM -smp cpus=$CPUS -drive file=$img,format=raw"
 
-          all_ifaces=""
-          for dev_path in /sys/class/net/*; do
-              dev=$(basename "$dev_path")
-              case "$dev" in
-                  lo|br*|tun*|tap*|docker*|veth*) continue ;;
-                  *) all_ifaces="$all_ifaces $dev" ;;
-              esac
-          done
+          # Networking mode detection:
+          # Check whether TUN/TAP is supported by the kernel and available in the container
+          can_use_tun=false
+          if [ "$NET_MODE" != "user" ]; then
+              mkdir -p /dev/net 2>/dev/null || true
+              if [ ! -c /dev/net/tun ]; then
+                  mknod /dev/net/tun c 10 200 2>/dev/null || true
+                  chmod 666 /dev/net/tun 2>/dev/null || true
+              fi
+              if ip tuntap add dev probe_tun mode tap 2>/dev/null; then
+                  can_use_tun=true
+                  ip link delete probe_tun 2>/dev/null || true
+              fi
+          fi
 
-          # 1. Determine primary WAN interface (br0 -> ether1)
-          # Priority: WAN_IFACE -> WAN_SUBNET -> macvlan/ipvlan -> 192.168.* -> default gateway -> first interface
-          wan_iface=""
-          for dev in $all_ifaces; do
-              dev_ip=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1)
-              if [ -n "$WAN_IFACE" ] && [ "$dev" = "$WAN_IFACE" ]; then
-                  wan_iface="$dev"
-                  break
-              fi
-              if [ -n "$WAN_SUBNET" ] && echo "$dev_ip" | grep -q "$WAN_SUBNET"; then
-                  wan_iface="$dev"
-                  break
-              fi
-              if ip -d link show "$dev" 2>/dev/null | grep -qE "macvlan|ipvlan"; then
-                  wan_iface="$dev"
-                  break
-              fi
-              if echo "$dev_ip" | grep -q "^192\.168\."; then
-                  wan_iface="$dev"
-                  break
-              fi
-          done
+          if [ "$can_use_tun" = "true" ]; then
+              echo "TUN/TAP is available. Configuring TAP / TC-mirred interface mode."
 
-          if [ -z "$wan_iface" ]; then
+              all_ifaces=""
+              for dev_path in /sys/class/net/*; do
+                  dev=$(basename "$dev_path")
+                  case "$dev" in
+                      lo|br*|tun*|tap*|docker*|veth*) continue ;;
+                      *) all_ifaces="$all_ifaces $dev" ;;
+                  esac
+              done
+
+              # 1. Determine primary WAN interface (br0 -> ether1)
+              # Priority: WAN_IFACE -> WAN_SUBNET -> macvlan/ipvlan -> 192.168.* -> default gateway -> first interface
+              wan_iface=""
               for dev in $all_ifaces; do
-                  if ip route show default dev "$dev" 2>/dev/null | grep -q "default"; then
+                  dev_ip=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1)
+                  if [ -n "$WAN_IFACE" ] && [ "$dev" = "$WAN_IFACE" ]; then
+                      wan_iface="$dev"
+                      break
+                  fi
+                  if [ -n "$WAN_SUBNET" ] && echo "$dev_ip" | grep -q "$WAN_SUBNET"; then
+                      wan_iface="$dev"
+                      break
+                  fi
+                  if ip -d link show "$dev" 2>/dev/null | grep -qE "macvlan|ipvlan"; then
+                      wan_iface="$dev"
+                      break
+                  fi
+                  if echo "$dev_ip" | grep -q "^192\.168\."; then
                       wan_iface="$dev"
                       break
                   fi
               done
-          fi
 
-          if [ -z "$wan_iface" ]; then
-              wan_iface=$(echo $all_ifaces | awk '{print $1}')
-          fi
-
-          # 2. Determine secondary LAN interface (br1 -> ether2)
-          # Priority: LAN_IFACE -> LAN_SUBNET -> 172.* private subnet
-          lan_iface=""
-          remaining_ifaces=""
-          for dev in $all_ifaces; do
-              [ "$dev" = "$wan_iface" ] && continue
-              dev_ip=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1)
-              if [ -z "$lan_iface" ]; then
-                  if [ -n "$LAN_IFACE" ] && [ "$dev" = "$LAN_IFACE" ]; then
-                      lan_iface="$dev"
-                      continue
-                  fi
-                  if [ -n "$LAN_SUBNET" ] && echo "$dev_ip" | grep -q "$LAN_SUBNET"; then
-                      lan_iface="$dev"
-                      continue
-                  fi
-                  if echo "$dev_ip" | grep -q "^172\."; then
-                      lan_iface="$dev"
-                      continue
-                  fi
+              if [ -z "$wan_iface" ]; then
+                  for dev in $all_ifaces; do
+                      if ip route show default dev "$dev" 2>/dev/null | grep -q "default"; then
+                          wan_iface="$dev"
+                          break
+                      fi
+                  done
               fi
-              remaining_ifaces="$remaining_ifaces $dev"
-          done
 
-          if [ -z "$lan_iface" ] && [ -n "$remaining_ifaces" ]; then
-              lan_iface=$(echo $remaining_ifaces | awk '{print $1}')
-              remaining_ifaces=$(echo $remaining_ifaces | sed "s/\b$lan_iface\b//")
-          fi
+              if [ -z "$wan_iface" ]; then
+                  wan_iface=$(echo $all_ifaces | awk '{print $1}')
+              fi
 
-          sorted_ifaces="$wan_iface $lan_iface $remaining_ifaces"
+              # 2. Determine secondary LAN interface (br1 -> ether2)
+              # Priority: LAN_IFACE -> LAN_SUBNET -> 172.* private subnet
+              lan_iface=""
+              remaining_ifaces=""
+              for dev in $all_ifaces; do
+                  [ "$dev" = "$wan_iface" ] && continue
+                  dev_ip=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1)
+                  if [ -z "$lan_iface" ]; then
+                      if [ -n "$LAN_IFACE" ] && [ "$dev" = "$LAN_IFACE" ]; then
+                          lan_iface="$dev"
+                          continue
+                      fi
+                      if [ -n "$LAN_SUBNET" ] && echo "$dev_ip" | grep -q "$LAN_SUBNET"; then
+                          lan_iface="$dev"
+                          continue
+                      fi
+                      if echo "$dev_ip" | grep -q "^172\."; then
+                          lan_iface="$dev"
+                          continue
+                      fi
+                  fi
+                  remaining_ifaces="$remaining_ifaces $dev"
+              done
 
-          sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
-          sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
-          sysctl -w net.ipv4.conf.default.rp_filter=0 2>/dev/null || true
-          iptables -t nat -F 2>/dev/null || true
-          iptables -F FORWARD 2>/dev/null || true
-          iptables -P FORWARD ACCEPT 2>/dev/null || true
+              if [ -z "$lan_iface" ] && [ -n "$remaining_ifaces" ]; then
+                  lan_iface=$(echo $remaining_ifaces | awk '{print $1}')
+                  remaining_ifaces=$(echo $remaining_ifaces | sed "s/\b$lan_iface\b//")
+              fi
 
-          if [ ! -c /dev/net/tun ]; then
-              mkdir -p /dev/net
-              mknod /dev/net/tun c 10 200 2>/dev/null || true
-          fi
+              sorted_ifaces="$wan_iface $lan_iface $remaining_ifaces"
 
-          for iface in $sorted_ifaces; do
-              [ -z "$iface" ] && continue
-              echo "Configuring interface: $iface (target: ether$((bridge_index + 1)))"
+              sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+              sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+              sysctl -w net.ipv4.conf.default.rp_filter=0 2>/dev/null || true
+              iptables -t nat -F 2>/dev/null || true
+              iptables -F FORWARD 2>/dev/null || true
+              iptables -P FORWARD ACCEPT 2>/dev/null || true
 
-              veth_mac=$(get_mac_address "$iface")
-              mac_file="/routeros/mac_ether$((bridge_index + 1))"
-              if [ -d "/routeros" ] && [ -s "$mac_file" ]; then
-                  saved_mac=$(cat "$mac_file" | tr -d '\r\n ' | head -n 1)
-                  echo "Found persistent MAC for ether$((bridge_index + 1)): $saved_mac"
-                  ip link set dev "$iface" down 2>/dev/null || true
-                  if ip link set dev "$iface" address "$saved_mac" 2>/dev/null; then
-                      echo "Successfully restored MAC $saved_mac to $iface"
-                      tap_mac="$saved_mac"
+              if [ ! -c /dev/net/tun ]; then
+                  mkdir -p /dev/net
+                  mknod /dev/net/tun c 10 200 2>/dev/null || true
+              fi
+
+              for iface in $sorted_ifaces; do
+                  [ -z "$iface" ] && continue
+                  echo "Configuring interface: $iface (target: ether$((bridge_index + 1)))"
+
+                  veth_mac=$(get_mac_address "$iface")
+                  mac_file="/routeros/mac_ether$((bridge_index + 1))"
+                  if [ -d "/routeros" ] && [ -s "$mac_file" ]; then
+                      saved_mac=$(cat "$mac_file" | tr -d '\r\n ' | head -n 1)
+                      echo "Found persistent MAC for ether$((bridge_index + 1)): $saved_mac"
+                      ip link set dev "$iface" down 2>/dev/null || true
+                      if ip link set dev "$iface" address "$saved_mac" 2>/dev/null; then
+                          echo "Successfully restored MAC $saved_mac to $iface"
+                          tap_mac="$saved_mac"
+                      else
+                          echo "Could not change MAC of $iface, using current: $veth_mac"
+                          tap_mac="$veth_mac"
+                          echo "$tap_mac" > "$mac_file"
+                      fi
+                      ip link set dev "$iface" up 2>/dev/null || true
                   else
-                      echo "Could not change MAC of $iface, using current: $veth_mac"
                       tap_mac="$veth_mac"
-                      echo "$tap_mac" > "$mac_file"
-                  fi
-                  ip link set dev "$iface" up 2>/dev/null || true
-              else
-                  tap_mac="$veth_mac"
-                  if [ -d "/routeros" ]; then
-                      echo "$tap_mac" > "$mac_file"
-                      echo "Saved persistent MAC for ether$((bridge_index + 1)): $tap_mac"
-                  fi
-              fi
-
-              iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)
-              iface_gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
-
-              if [ -z "$iface_gw" ] && [ "$bridge_index" -eq 0 ]; then
-                  if [ -n "$GATEWAY" ]; then
-                      iface_gw="$GATEWAY"
-                  elif [ -n "$iface_ip" ]; then
-                      ip_prefix=$(echo "$iface_ip" | cut -d'/' -f1 | sed 's/\.[0-9]*$//')
-                      iface_gw="${ip_prefix}.1"
-                  fi
-              fi
-
-              ip_no_mask=""
-              ip_mask=""
-              if [ -n "$iface_ip" ]; then
-                  ip_no_mask=$(echo "$iface_ip" | cut -d'/' -f1)
-                  ip_cidr=$(echo "$iface_ip" | cut -s -d'/' -f2)
-                  [ -z "$ip_cidr" ] && ip_cidr=24
-                  ip_mask=$(cidr2mask "$ip_cidr")
-              fi
-
-              tap="tap$bridge_index"
-              can_use_tc=false
-
-              if ip tuntap add dev "$tap" mode tap 2>/dev/null; then
-                  ip link set dev "$tap" address "$tap_mac" up 2>/dev/null || true
-                  ip link set dev "$iface" promisc on 2>/dev/null || true
-                  tc qdisc del dev "$iface" ingress 2>/dev/null || true
-                  tc qdisc del dev "$tap" ingress 2>/dev/null || true
-
-                  if tc qdisc add dev "$iface" ingress 2>/dev/null && \
-                     (tc filter add dev "$iface" ingress protocol all matchall action mirred egress redirect dev "$tap" 2>/dev/null || \
-                      tc filter add dev "$iface" ingress protocol all u32 match u32 0 0 action mirred egress redirect dev "$tap" 2>/dev/null) && \
-                     tc qdisc add dev "$tap" ingress 2>/dev/null && \
-                     (tc filter add dev "$tap" ingress protocol all matchall action mirred egress redirect dev "$iface" 2>/dev/null || \
-                      tc filter add dev "$tap" ingress protocol all u32 match u32 0 0 action mirred egress redirect dev "$iface" 2>/dev/null); then
-                      can_use_tc=true
-                      echo "Direct L2 mode (TC mirred) enabled for $iface <-> $tap (MAC: $tap_mac)"
-                  fi
-              fi
-
-              if [ "$can_use_tc" = "true" ]; then
-                  if [ -n "$ip_no_mask" ]; then
-                      ip addr flush dev "$iface"
-
-                      udhcpd_conf="/tmp/udhcpd_${tap}.conf"
-                      udhcpd_leases="/tmp/udhcpd_${tap}.leases"
-                      touch "$udhcpd_leases"
-
-                      echo "start $ip_no_mask" > "$udhcpd_conf"
-                      echo "end $ip_no_mask" >> "$udhcpd_conf"
-                      echo "interface $tap" >> "$udhcpd_conf"
-                      echo "max_leases 1" >> "$udhcpd_conf"
-                      echo "lease_file $udhcpd_leases" >> "$udhcpd_conf"
-                      echo "opt subnet $ip_mask" >> "$udhcpd_conf"
-                      if [ "$bridge_index" -eq 0 ] && [ -n "$iface_gw" ]; then
-                          echo "opt router $iface_gw" >> "$udhcpd_conf"
-                          echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
-                      fi
-                      echo "static_lease $tap_mac $ip_no_mask" >> "$udhcpd_conf"
-
-                      server_ip="${iface_gw:-${ip_prefix}.1}"
-                      echo "Starting udhcpd on $tap (MikroTik IP: $ip_no_mask, GW: ${iface_gw:-none}, Server-ID: $server_ip)..."
-                      udhcpd -I "$server_ip" -f "$udhcpd_conf" &
-                  fi
-
-                  qemu="$qemu -netdev tap,id=$tap,ifname=$tap,script=no,downscript=no -device virtio-net,netdev=$tap,mac=$tap_mac "
-              else
-                  echo "TC mirred failed or unavailable, falling back to internal bridge + DNAT for $iface"
-                  ip link delete "$tap" 2>/dev/null || true
-
-                  bridge="br$bridge_index"
-                  ip link add name "$bridge" type bridge
-                  internal_net="10.199.$((bridge_index + 1))"
-                  bridge_ip="${internal_net}.1"
-                  mikrotik_ip="${internal_net}.2"
-
-                  ip addr add "${bridge_ip}/30" dev "$bridge"
-                  ip link set dev "$bridge" up
-                  echo "allow $bridge" >> /etc/qemu/bridge.conf
-
-                  if [ -z "$iface_gw" ] && [ "$bridge" = "br0" ]; then
-                      if [ -n "$iface_gw" ]; then
-                          ip route replace default via "$iface_gw" dev "$iface" 2>/dev/null || true
+                      if [ -d "/routeros" ]; then
+                          echo "$tap_mac" > "$mac_file"
+                          echo "Saved persistent MAC for ether$((bridge_index + 1)): $tap_mac"
                       fi
                   fi
 
+                  iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)
+                  iface_gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
+
+                  if [ -z "$iface_gw" ] && [ "$bridge_index" -eq 0 ]; then
+                      if [ -n "$GATEWAY" ]; then
+                          iface_gw="$GATEWAY"
+                      elif [ -n "$iface_ip" ]; then
+                          ip_prefix=$(echo "$iface_ip" | cut -d'/' -f1 | sed 's/\.[0-9]*$//')
+                          iface_gw="${ip_prefix}.1"
+                      fi
+                  fi
+
+                  ip_no_mask=""
+                  ip_mask=""
                   if [ -n "$iface_ip" ]; then
-                      udhcpd_conf="/tmp/udhcpd_${bridge}.conf"
-                      udhcpd_leases="/tmp/udhcpd_${bridge}.leases"
-                      touch "$udhcpd_leases"
-
-                      echo "start $mikrotik_ip" > "$udhcpd_conf"
-                      echo "end $mikrotik_ip" >> "$udhcpd_conf"
-                      echo "interface $bridge" >> "$udhcpd_conf"
-                      echo "max_leases 1" >> "$udhcpd_conf"
-                      echo "lease_file $udhcpd_leases" >> "$udhcpd_conf"
-                      echo "opt subnet 255.255.255.252" >> "$udhcpd_conf"
-                      if [ "$bridge" = "br0" ]; then
-                          echo "opt router $bridge_ip" >> "$udhcpd_conf"
-                          echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
-                      fi
-                      echo "static_lease $tap_mac $mikrotik_ip" >> "$udhcpd_conf"
-
-                      echo "Starting udhcpd on $bridge (MikroTik IP: $mikrotik_ip, GW: $bridge_ip)..."
-                      udhcpd -I "$bridge_ip" -f "$udhcpd_conf" &
-
-                      echo "Configuring forwarding: $ip_no_mask ($iface) <-> $mikrotik_ip ($bridge)..."
-                      iptables -t nat -A PREROUTING -d "$ip_no_mask" -j DNAT --to-destination "$mikrotik_ip"
-                      iptables -t nat -A OUTPUT -d "$ip_no_mask" -j DNAT --to-destination "$mikrotik_ip"
-                      iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
-                      iptables -t nat -A POSTROUTING -o "$bridge" -j MASQUERADE
+                      ip_no_mask=$(echo "$iface_ip" | cut -d'/' -f1)
+                      ip_cidr=$(echo "$iface_ip" | cut -s -d'/' -f2)
+                      [ -z "$ip_cidr" ] && ip_cidr=24
+                      ip_mask=$(cidr2mask "$ip_cidr")
                   fi
 
-                  qemu="$qemu -netdev bridge,id=$bridge,br=$bridge -device virtio-net,netdev=$bridge,mac=$tap_mac "
+                  tap="tap$bridge_index"
+                  can_use_tc=false
+
+                  if ip tuntap add dev "$tap" mode tap 2>/dev/null; then
+                      ip link set dev "$tap" address "$tap_mac" up 2>/dev/null || true
+                      ip link set dev "$iface" promisc on 2>/dev/null || true
+                      tc qdisc del dev "$iface" ingress 2>/dev/null || true
+                      tc qdisc del dev "$tap" ingress 2>/dev/null || true
+
+                      if tc qdisc add dev "$iface" ingress 2>/dev/null && \
+                         (tc filter add dev "$iface" ingress protocol all matchall action mirred egress redirect dev "$tap" 2>/dev/null || \
+                          tc filter add dev "$iface" ingress protocol all u32 match u32 0 0 action mirred egress redirect dev "$tap" 2>/dev/null) && \
+                         tc qdisc add dev "$tap" ingress 2>/dev/null && \
+                         (tc filter add dev "$tap" ingress protocol all matchall action mirred egress redirect dev "$iface" 2>/dev/null || \
+                          tc filter add dev "$tap" ingress protocol all u32 match u32 0 0 action mirred egress redirect dev "$iface" 2>/dev/null); then
+                          can_use_tc=true
+                          echo "Direct L2 mode (TC mirred) enabled for $iface <-> $tap (MAC: $tap_mac)"
+                      fi
+                  fi
+
+                  if [ "$can_use_tc" = "true" ]; then
+                      if [ -n "$ip_no_mask" ]; then
+                          ip addr flush dev "$iface"
+
+                          udhcpd_conf="/tmp/udhcpd_${tap}.conf"
+                          udhcpd_leases="/tmp/udhcpd_${tap}.leases"
+                          touch "$udhcpd_leases"
+
+                          echo "start $ip_no_mask" > "$udhcpd_conf"
+                          echo "end $ip_no_mask" >> "$udhcpd_conf"
+                          echo "interface $tap" >> "$udhcpd_conf"
+                          echo "max_leases 1" >> "$udhcpd_conf"
+                          echo "lease_file $udhcpd_leases" >> "$udhcpd_conf"
+                          echo "opt subnet $ip_mask" >> "$udhcpd_conf"
+                          if [ "$bridge_index" -eq 0 ] && [ -n "$iface_gw" ]; then
+                              echo "opt router $iface_gw" >> "$udhcpd_conf"
+                              echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
+                          fi
+                          echo "static_lease $tap_mac $ip_no_mask" >> "$udhcpd_conf"
+
+                          server_ip="${iface_gw:-${ip_prefix}.1}"
+                          echo "Starting udhcpd on $tap (MikroTik IP: $ip_no_mask, GW: ${iface_gw:-none}, Server-ID: $server_ip)..."
+                          udhcpd -I "$server_ip" -f "$udhcpd_conf" &
+                      fi
+
+                      qemu="$qemu -netdev tap,id=$tap,ifname=$tap,script=no,downscript=no -device virtio-net,netdev=$tap,mac=$tap_mac "
+                  else
+                      echo "TC mirred failed or unavailable, falling back to internal bridge + DNAT for $iface"
+                      ip link delete "$tap" 2>/dev/null || true
+
+                      bridge="br$bridge_index"
+                      ip link add name "$bridge" type bridge
+                      internal_net="10.199.$((bridge_index + 1))"
+                      bridge_ip="${internal_net}.1"
+                      mikrotik_ip="${internal_net}.2"
+
+                      ip addr add "${bridge_ip}/30" dev "$bridge"
+                      ip link set dev "$bridge" up
+                      echo "allow $bridge" >> /etc/qemu/bridge.conf
+
+                      if [ -z "$iface_gw" ] && [ "$bridge" = "br0" ]; then
+                          if [ -n "$iface_gw" ]; then
+                              ip route replace default via "$iface_gw" dev "$iface" 2>/dev/null || true
+                          fi
+                      fi
+
+                      if [ -n "$iface_ip" ]; then
+                          udhcpd_conf="/tmp/udhcpd_${bridge}.conf"
+                          udhcpd_leases="/tmp/udhcpd_${bridge}.leases"
+                          touch "$udhcpd_leases"
+
+                          echo "start $mikrotik_ip" > "$udhcpd_conf"
+                          echo "end $mikrotik_ip" >> "$udhcpd_conf"
+                          echo "interface $bridge" >> "$udhcpd_conf"
+                          echo "max_leases 1" >> "$udhcpd_conf"
+                          echo "lease_file $udhcpd_leases" >> "$udhcpd_conf"
+                          echo "opt subnet 255.255.255.252" >> "$udhcpd_conf"
+                          if [ "$bridge" = "br0" ]; then
+                              echo "opt router $bridge_ip" >> "$udhcpd_conf"
+                              echo "opt dns 8.8.8.8 1.1.1.1" >> "$udhcpd_conf"
+                          fi
+                          echo "static_lease $tap_mac $mikrotik_ip" >> "$udhcpd_conf"
+
+                          echo "Starting udhcpd on $bridge (MikroTik IP: $mikrotik_ip, GW: $bridge_ip)..."
+                          udhcpd -I "$bridge_ip" -f "$udhcpd_conf" &
+
+                          echo "Configuring forwarding: $ip_no_mask ($iface) <-> $mikrotik_ip ($bridge)..."
+                          iptables -t nat -A PREROUTING -d "$ip_no_mask" -j DNAT --to-destination "$mikrotik_ip"
+                          iptables -t nat -A OUTPUT -d "$ip_no_mask" -j DNAT --to-destination "$mikrotik_ip"
+                          iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
+                          iptables -t nat -A POSTROUTING -o "$bridge" -j MASQUERADE
+                      fi
+
+                      qemu="$qemu -netdev bridge,id=$bridge,br=$bridge -device virtio-net,netdev=$bridge,mac=$tap_mac "
+                  fi
+
+                  bridge_index=$((bridge_index + 1))
+              done
+          else
+              echo "TUN/TAP is unavailable on this host or NET_MODE=user is requested."
+              echo "Using QEMU user-mode (SLIRP) networking."
+
+              mac_file="/routeros/mac_ether1"
+              if [ -d "/routeros" ] && [ -s "$mac_file" ]; then
+                  user_mac=$(cat "$mac_file" | tr -d '\r\n ' | head -n 1)
+                  echo "Found persistent MAC for ether1: $user_mac"
+              else
+                  user_mac="52:54:00:12:34:56"
+                  if [ -d "/routeros" ]; then
+                      echo "$user_mac" > "$mac_file"
+                      echo "Saved persistent MAC for ether1: $user_mac"
+                  fi
               fi
 
-              bridge_index=$((bridge_index + 1))
-          done
+              hostfwd_args=""
+              if [ -n "$HOSTFWD" ]; then
+                  for fwd in $(echo "$HOSTFWD" | tr ',' ' '); do
+                      [ -n "$fwd" ] && hostfwd_args="${hostfwd_args},hostfwd=${fwd}"
+                  done
+              else
+                  # Standard RouterOS ports:
+                  # 8291: Winbox
+                  # 80: HTTP (Webfig)
+                  # 443: HTTPS
+                  # 8080: Web proxy
+                  # 1080: Socks proxy
+                  # 8728: API
+                  # 8729: API-SSL
+                  # 22: SSH
+                  tcp_ports="${PORTS:-8291,80,443,8080,1080,8728,8729,22}"
+                  for p in $(echo "$tcp_ports" | tr ',' ' '); do
+                      [ -z "$p" ] && continue
+                      case "$p" in
+                          *:*)
+                              hp=$(echo "$p" | cut -d: -f1)
+                              gp=$(echo "$p" | cut -d: -f2)
+                              ;;
+                          *)
+                              hp="$p"
+                              gp="$p"
+                              ;;
+                      esac
+                      hostfwd_args="${hostfwd_args},hostfwd=tcp::${hp}-:${gp}"
+                  done
+
+                  if [ -n "$UDP_PORTS" ]; then
+                      for p in $(echo "$UDP_PORTS" | tr ',' ' '); do
+                          [ -z "$p" ] && continue
+                          case "$p" in
+                              *:*)
+                                  hp=$(echo "$p" | cut -d: -f1)
+                                  gp=$(echo "$p" | cut -d: -f2)
+                                  ;;
+                              *)
+                                  hp="$p"
+                                  gp="$p"
+                                  ;;
+                          esac
+                          hostfwd_args="${hostfwd_args},hostfwd=udp::${hp}-:${gp}"
+                      done
+                  fi
+              fi
+
+              echo "SLIRP Forwarded Ports: ${hostfwd_args}"
+              qemu="$qemu -netdev user,id=net0${hostfwd_args} -device virtio-net,netdev=net0,mac=$user_mac "
+          fi
 
           echo "qemu: $qemu"
           exec $qemu
@@ -486,11 +572,12 @@ jobs:
                 amd64) apk add --no-cache qemu-system-x86_64 ;; \
                 arm64) apk add --no-cache qemu-system-aarch64 ;; \
               esac \
-              && apk add --no-cache busybox-extras dnsmasq iptables iproute2 iproute2-tc socat \
+              && apk add --no-cache busybox-extras dnsmasq iptables iproute2 iproute2-tc socat libslirp \
               && rm -rf /var/cache/apk/*
           RUN mkdir -p /diskimage /routeros
           COPY ${TARGETARCH}/*.img /diskimage/
           COPY start.sh /start.sh
+          EXPOSE 8291 80 443 8080 1080 8728 8729 22
           ENTRYPOINT ["/start.sh"]
           EOF
 
