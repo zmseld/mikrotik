@@ -450,10 +450,8 @@ jobs:
                       ip link set dev "$bridge" up
                       echo "allow $bridge" >> /etc/qemu/bridge.conf
 
-                      if [ -z "$iface_gw" ] && [ "$bridge" = "br0" ]; then
-                          if [ -n "$iface_gw" ]; then
-                              ip route replace default via "$iface_gw" dev "$iface" 2>/dev/null || true
-                          fi
+                      if [ -n "$iface_gw" ] && [ "$bridge" = "br0" ]; then
+                          ip route replace default via "$iface_gw" dev "$iface" 2>/dev/null || true
                       fi
 
                       if [ -n "$iface_ip" ]; then
