@@ -169,9 +169,9 @@ jobs:
           sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
           sysctl -w net.ipv4.ip_nonlocal_bind=1 2>/dev/null || true
 
-          MEM="${MEM:=512m}"
-          DISK="${DISK:=128M}"
-          CPUS="${CPUS:=1}"
+          MEM="${MEM:-${RAM_SIZE:-512m}}"
+          DISK="${DISK:-${DISK_SIZE:-128M}}"
+          CPUS="${CPUS:-${CPU_COUNT:-1}}"
           bridge_index=0
 
           get_mac_address() {
